@@ -1,3 +1,6 @@
 .venv/
+venv/
 __pycache__/
 .pytest_cache/
+saved_loops/
+config.json

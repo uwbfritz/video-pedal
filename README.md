@@ -175,21 +175,50 @@ Two things to watch for:
 | release right Option | play the recording on a loop, with a short dissolve at the seam. |
 | hold right Option again | replace the loop with a new recording. |
 | tap right Option (under 1 s) | ignored; nothing changes. |
-| press right Command | go live: the loop dissolves into the live feed. Also cancels a recording in progress. |
+| press right Command (or right Ctrl on Windows) | go live: the loop dissolves into the live feed. Also cancels a recording in progress. |
 
-Both keys work from any app. Right Command only counts when pressed on its own; as
-part of a shortcut (right-Cmd+Tab, say) it is ignored. The preview window also takes
-`r` (start / stop recording), `l` (go live) and `q` (quit). Ctrl+C in the terminal
-also quits.
+Both keys work from any app. Right Command / right Ctrl only counts when pressed on its own; as
+part of a shortcut it is ignored.
+
+### Preview Window Controls
+
+| key | does |
+|---|---|
+| `r` | start / stop recording |
+| `l` | go live / cancel recording |
+| `f` | freeze frame (instant still snapshot with smooth dissolve) |
+| `p` | toggle ping-pong (forward-reverse boomerang) loop mode |
+| `s` | save active loop to disk as an MP4 |
+| `o` or `Tab` | cycle alignment overlay mode: Ghost &rarr; Edge silhouette &rarr; Diff heat-map &rarr; Split screen |
+| `1`–`5` | switch between 5 independent loop preset slots |
+| `m` | toggle small floating window mode (frameless PiP pinned on top of other apps; click & drag anywhere to move) |
+| `k` | configure global pedal & live keys interactively in the UI |
+| `q` | quit |
+
+Ctrl+C in the terminal also quits.
+
+### Visual State Feedback
+
+- **Perimeter Colored Halo / Border**:
+  - **LIVE**: Solid rich emerald green border.
+  - **LOOPING**: Warm amber-orange border with gentle breathing pulse.
+  - **RECORDING**: High-alert flashing red border.
+  - **FREEZE**: Ice-blue border.
+- **On-Screen State Transition Banners**: Instant high-visibility toast banner (e.g. `>>> YOU ARE LIVE <<<` or `>>> LOOPING STARTED <<<`) whenever state changes, so your live status is unmistakable even in peripheral vision.
 
 ## Handy variants
 
 ```
 python loop_pedal.py --no-vcam        # no virtual camera needed: preview only
+python loop_pedal.py --mini           # start in compact floating window mode
+python loop_pedal.py --topmost        # keep window always pinned on top of Zoom/other apps
 python loop_pedal.py --list-cameras   # which index is the real webcam?
 python loop_pedal.py --camera 1       # use that index
+python loop_pedal.py --ping-pong      # smooth boomerang looping
+python loop_pedal.py --load-loop clip.mp4 # preload pre-recorded loop
+python loop_pedal.py --no-smart-seam  # disable automatic pose-matching seam search
 python loop_pedal.py --key f13        # different pedal key
-python loop_pedal.py --live-key f14   # different go-live key (or ctrl_r on Windows / Linux)
+python loop_pedal.py --live-key f14   # different go-live key
 python loop_pedal.py --overlay 0      # no ghost: preview shows exactly what goes out
 python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going live
 ```
@@ -198,8 +227,8 @@ python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going liv
 
 | flag | default | |
 |---|---|---|
-| `--key` | `alt_r` | pedal key. Modifier names like `alt_r`, `ctrl_r`, `shift_r`, function keys like `f13`, or a single letter (which also gets typed into whatever has focus). |
-| `--live-key` | `cmd_r` | go-live key, pressed once on its own to end the loop or cancel a recording. Same key names as `--key`; must differ from it. |
+| `--key` | `alt_r` | pedal key. Modifier names like `alt_r`, `ctrl_r`, `shift_r`, function keys like `f13`, or a single letter. |
+| `--live-key` | `ctrl_r` (Win) / `cmd_r` (macOS) | go-live key, pressed once on its own to end the loop or cancel a recording. |
 | `--camera` | auto | OpenCV index of the real webcam; default is the first index that is a live sensor |
 | `--size` | `1280x720` | requested capture size |
 | `--fps` | `30` | output frame rate |
@@ -208,6 +237,14 @@ python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going liv
 | `--crossfade` | `0.5` | seconds of dissolve at the loop seam and when the loop dissolves into live, `0` for hard cuts |
 | `--overlay` | `0.5` | preview only: opacity of the loop ghosted over the live camera while looping, `0` for no ghost |
 | `--quality` | `90` | JPEG quality of frames held in RAM |
+| `--smart-seam` | `True` | automatically searches candidate head/tail frames for minimal visual difference to prevent ghosting |
+| `--ping-pong` | `False` | loop in forward-reverse boomerang mode |
+| `--load-loop` | `None` | preload an MP4 video clip directly into slot 1 |
+| `--save-dir` | `./saved_loops` | directory where loop recordings are saved |
+| `--topmost` | `False` | keep preview window always on top of other apps |
+| `--mini` | `False` | start in small floating window mode |
+| `--frameless` | `True` | remove OS window title bar and buttons in mini mode (click & drag anywhere to move) |
+| `--no-border` | `False` | disable state color perimeter border |
 | `--no-pedal` | | skip the global hotkey |
 | `--no-vcam` | | preview only, no virtual camera |
 | `--no-preview` | | no window; Ctrl+C to quit |
