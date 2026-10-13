@@ -9,11 +9,13 @@ import sys
 from loop_pedal import (
     set_window_borderless,
     FREEZE, LIVE, LOOPING, RECORDING,
-    Pedal, ToastNotifier, draw_hud,
+    LoopPedal, Pedal, RawCodec, ToastNotifier, draw_hud,
+    draw_control_dock, draw_help_modal, draw_text_shadow, draw_vector_icon,
     draw_key_config_modal, draw_state_border,
     draw_rounded_rect, draw_glass_pill,
     key_to_str, load_config, parse_args, save_config
 )
+
 
 
 def make_canvas(w=640, h=480):
@@ -163,3 +165,57 @@ class TestBorderlessWindow:
             assert set_window_borderless(win_name, False) is True
         finally:
             cv2.destroyAllWindows()
+
+
+class TestModernUiComponents:
+    def test_draw_text_shadow(self):
+        import cv2
+        img = make_canvas(w=300, h=100)
+        draw_text_shadow(img, "TEST SHADOW", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        assert np.any(img > 0)
+
+    def test_draw_vector_icons(self):
+        img = make_canvas(w=400, h=100)
+        for idx, icon in enumerate(["rec", "stop", "play", "pause", "boom", "gear", "help", "save", "expand"]):
+            draw_vector_icon(img, icon, (30 + idx * 40, 50), 20, (0, 200, 255))
+        assert np.any(img > 0)
+
+    def test_draw_help_modal(self):
+        img = make_canvas(w=800, h=600)
+        draw_help_modal(img, current_pedal="alt_r", current_live="ctrl_r", mouse_pos=(100, 100))
+        assert np.any(img > 0)
+
+    def test_draw_control_dock_registers_buttons(self):
+        img = make_canvas(w=800, h=600)
+        buttons = []
+        info = {
+            "state": LIVE,
+            "elapsed": None,
+            "total": None,
+            "progress": None,
+            "slot": 1,
+            "ping_pong": False,
+            "slots": {1: {"filled": True, "duration": 4.5}, 2: {"filled": False, "duration": 0.0}}
+        }
+        draw_control_dock(img, info, key="alt_r", live_key="ctrl_r",
+                          align_mode="ghost", mouse_pos=(400, 570), clickable_buttons=buttons)
+        assert np.any(img > 0)
+        assert len(buttons) >= 8
+        button_ids = [b["id"] for b in buttons]
+        assert "toggle_record" in button_ids
+        assert "toggle_freeze" in button_ids
+        assert "slot_1" in button_ids
+        assert "slot_2" in button_ids
+        assert "toggle_ping_pong" in button_ids
+        assert "cycle_align" in button_ids
+        assert "toggle_help" in button_ids
+        assert "toggle_mini" in button_ids
+
+    def test_hud_info_includes_slots_metadata(self):
+        pedal = LoopPedal(RawCodec(), fps=10, max_seconds=10, min_seconds=0.2, crossfade_seconds=0.2)
+        info = pedal.hud_info()
+        assert "slots" in info
+        assert 1 in info["slots"]
+        assert info["slots"][1]["filled"] is False
+        assert info["slots"][1]["duration"] == 0.0
+

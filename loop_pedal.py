@@ -205,6 +205,30 @@ def compute_alignment_score(live: np.ndarray, loop: np.ndarray) -> float:
     return max(0.0, min(1.0, 1.0 - (mae / 60.0)))
 
 
+def compute_presence_score(live: np.ndarray, ref: np.ndarray) -> float:
+    """Calculates center-weighted presence/posture score against reference loop.
+    Focuses on central torso and head region where seated person appears.
+    Returns 0.0 .. 1.0 (higher = person present and posture matches).
+    """
+    if live.shape != ref.shape:
+        ref = cv2.resize(ref, (live.shape[1], live.shape[0]))
+    g_live = cv2.cvtColor(live, cv2.COLOR_BGR2GRAY) if (len(live.shape) == 3 and live.shape[2] >= 3) else live
+    g_ref = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY) if (len(ref.shape) == 3 and ref.shape[2] >= 3) else ref
+    t_live = cv2.resize(g_live, (64, 36), interpolation=cv2.INTER_NEAREST)
+    t_ref = cv2.resize(g_ref, (64, 36), interpolation=cv2.INTER_NEAREST)
+
+    full_mae = float(np.mean(np.abs(t_live.astype(np.float32) - t_ref.astype(np.float32))))
+    full_score = max(0.0, min(1.0, 1.0 - (full_mae / 60.0)))
+
+    # Central torso/head ROI: vertical 10%..88% (rows 4..32), horizontal 15%..85% (cols 10..54)
+    c_live = t_live[4:32, 10:54]
+    c_ref = t_ref[4:32, 10:54]
+    c_mae = float(np.mean(np.abs(c_live.astype(np.float32) - c_ref.astype(np.float32))))
+    c_score = max(0.0, min(1.0, 1.0 - (c_mae / 60.0)))
+
+    return float(0.70 * c_score + 0.30 * full_score)
+
+
 def blend_overlay(live: np.ndarray, loop: np.ndarray, alpha: float = 0.5,
                   mode: str = "ghost") -> np.ndarray:
     """Preview only: displays loop alignment over live camera.
@@ -316,6 +340,136 @@ class Player:
 
 
 # --------------------------------------------------------------------------- #
+# Studio post-processing (Background blur & Color grading LUTs)
+# --------------------------------------------------------------------------- #
+
+STUDIO_LUTS = ["normal", "warm", "cool", "vibrant", "noir", "soft"]
+STUDIO_BLURS = ["off", "light", "studio", "strong"]
+
+
+class StudioEffects:
+    """Real-time color grading LUTs and portrait depth bokeh blur."""
+
+    def __init__(self, lut_name: str = "normal", blur_mode: str = "off"):
+        self.lut_name = lut_name if lut_name in STUDIO_LUTS else "normal"
+        self.blur_mode = blur_mode if blur_mode in STUDIO_BLURS else "off"
+        self._mask_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._warm_luts = None
+        self._cool_luts = None
+        self._noir_lut = None
+        self._init_luts()
+
+    def _init_luts(self):
+        # Warm studio: boosted reds/yellows, flattering skin tones
+        r_w = np.clip(np.linspace(0, 265, 256), 0, 255).astype(np.uint8)
+        g_w = np.clip(np.linspace(0, 258, 256), 0, 255).astype(np.uint8)
+        b_w = np.clip(np.linspace(0, 245, 256), 0, 255).astype(np.uint8)
+        self._warm_luts = (b_w, g_w, r_w)
+
+        # Cool cinematic: crisp teal-cyan tone curve
+        b_c = np.clip(np.linspace(5, 265, 256), 0, 255).astype(np.uint8)
+        g_c = np.clip(np.linspace(0, 252, 256), 0, 255).astype(np.uint8)
+        r_c = np.clip(np.linspace(0, 245, 256), 0, 255).astype(np.uint8)
+        self._cool_luts = (b_c, g_c, r_c)
+
+        # Noir: S-curve contrast monochrome
+        s_lut = np.clip(128.0 + 128.0 * np.sin((np.arange(256) - 128) / 128.0 * (np.pi / 2)), 0, 255).astype(np.uint8)
+        self._noir_lut = s_lut
+
+    def set_lut(self, name: str) -> None:
+        if name in STUDIO_LUTS:
+            self.lut_name = name
+
+    def cycle_lut(self) -> str:
+        idx = (STUDIO_LUTS.index(self.lut_name) + 1) % len(STUDIO_LUTS)
+        self.lut_name = STUDIO_LUTS[idx]
+        return self.lut_name
+
+    def set_blur(self, mode: str) -> None:
+        if mode in STUDIO_BLURS:
+            self.blur_mode = mode
+
+    def cycle_blur(self) -> str:
+        idx = (STUDIO_BLURS.index(self.blur_mode) + 1) % len(STUDIO_BLURS)
+        self.blur_mode = STUDIO_BLURS[idx]
+        return self.blur_mode
+
+    def _get_vignette_mask(self, h: int, w: int) -> np.ndarray:
+        key = (w, h)
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+        y, x = np.ogrid[:h, :w]
+        cx, cy = w / 2.0, h * 0.46
+        rx, ry = w * 0.38, h * 0.46
+        dist = ((x - cx) ** 2) / (rx ** 2) + ((y - cy) ** 2) / (ry ** 2)
+        mask = np.clip(1.0 - dist, 0.0, 1.0).astype(np.float32)
+        k_blur = max(11, (min(w, h) // 16) | 1)
+        mask = cv2.GaussianBlur(mask, (k_blur, k_blur), 0)
+        mask_3c = mask[:, :, None]
+        self._mask_cache[key] = mask_3c
+        return mask_3c
+
+    def apply_lut(self, frame: np.ndarray) -> np.ndarray:
+        if self.lut_name == "normal" or frame is None or len(frame.shape) < 3:
+            return frame
+
+        if self.lut_name == "warm":
+            b, g, r = cv2.split(frame)
+            b_l, g_l, r_l = self._warm_luts
+            return cv2.merge([cv2.LUT(b, b_l), cv2.LUT(g, g_l), cv2.LUT(r, r_l)])
+
+        if self.lut_name == "cool":
+            b, g, r = cv2.split(frame)
+            b_l, g_l, r_l = self._cool_luts
+            return cv2.merge([cv2.LUT(b, b_l), cv2.LUT(g, g_l), cv2.LUT(r, r_l)])
+
+        if self.lut_name == "vibrant":
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            hsv[:, :, 1] = cv2.multiply(hsv[:, :, 1], 1.25)
+            return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+        if self.lut_name == "noir":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            contrasted = cv2.LUT(gray, self._noir_lut)
+            return cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)
+
+        if self.lut_name == "soft":
+            small_w, small_h = max(16, frame.shape[1] // 2), max(16, frame.shape[0] // 2)
+            small = cv2.resize(frame, (small_w, small_h))
+            b_small = cv2.GaussianBlur(small, (15, 15), 0)
+            bloom = cv2.resize(b_small, (frame.shape[1], frame.shape[0]))
+            return cv2.addWeighted(frame, 0.78, bloom, 0.22, 0)
+
+        return frame
+
+    def apply_blur(self, frame: np.ndarray) -> np.ndarray:
+        if self.blur_mode == "off" or frame is None or len(frame.shape) < 3:
+            return frame
+
+        ksize_map = {"light": 11, "studio": 21, "strong": 31}
+        ksize = ksize_map.get(self.blur_mode, 21)
+        h, w = frame.shape[:2]
+
+        small_w, small_h = max(16, w // 4), max(16, h // 4)
+        small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+        b_small = cv2.GaussianBlur(small, (ksize, ksize), 0)
+        blurred = cv2.resize(b_small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        mask = self._get_vignette_mask(h, w)
+        return (frame.astype(np.float32) * mask + blurred.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
+
+    def apply(self, frame: np.ndarray) -> np.ndarray:
+        if self.lut_name == "normal" and self.blur_mode == "off":
+            return frame
+        out = frame
+        if self.blur_mode != "off":
+            out = self.apply_blur(out)
+        if self.lut_name != "normal":
+            out = self.apply_lut(out)
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # State machine
 # --------------------------------------------------------------------------- #
 
@@ -324,7 +478,9 @@ class LoopPedal:
 
     def __init__(self, codec, fps: float, max_seconds: float, min_seconds: float,
                  crossfade_seconds: float, smart_seam: bool = False,
-                 ping_pong: bool = False, log=print):
+                 ping_pong: bool = False, auto_cut: bool = True,
+                 auto_stealth: bool = False, stealth_threshold: float = 0.65,
+                 log=print):
         self.state = LIVE
         self.fps = fps
         self._codec = codec
@@ -333,6 +489,28 @@ class LoopPedal:
         self._crossfade = int(crossfade_seconds * fps)
         self.smart_seam = smart_seam
         self.ping_pong = ping_pong
+
+        # Feature #1: AI Pose Auto-Cut
+        self.auto_cut = auto_cut
+        self.auto_cut_armed = False
+        self.auto_cut_arm_time = 0.0
+        self.auto_cut_threshold = 0.80
+        self.auto_cut_timeout = 6.0
+
+        # Feature #3: Presence Sensor Auto-Stealth
+        self.auto_stealth = auto_stealth
+        self.stealth_absence_frames = 0
+        self.stealth_absence_threshold = max(5, int(1.2 * fps))
+        self.stealth_engaged_by_sensor = False
+        self.stealth_threshold = stealth_threshold
+        self.stealth_return_threshold = min(0.85, max(0.68, stealth_threshold + 0.07))
+        self.stealth_return_frames = 0
+        self.stealth_return_required = max(3, int(0.4 * fps))
+        self.last_presence_score: float | None = None
+
+        # Feature #6: Studio Post-Processing
+        self.studio = StudioEffects()
+
         self._player: Player | None = None
         self._fade_left = 0  # frames left in the loop-to-live dissolve
         self._frozen_frame: np.ndarray | None = None
@@ -347,10 +525,11 @@ class LoopPedal:
         if self.state == RECORDING:
             return
         if self._fade_left:
-            # The live key already ended the loop; a short tap must not bring it back.
             self._fade_left = 0
             self._player = None
             self._frozen_frame = None
+        self.auto_cut_armed = False
+        self.stealth_engaged_by_sensor = False
         self._recorder.take()
         self.state = RECORDING
         self._log("REC   recording (live feed still going out) - release to loop")
@@ -360,7 +539,6 @@ class LoopPedal:
             return
         frames = self._recorder.take()
         if len(frames) < self._min_frames:
-            # Too short to loop: throw it away and carry on with whatever was playing.
             self.state = LOOPING if self._player is not None else LIVE
             self._log(f"{self.state:<5} tap ignored (hold at least {self._min_frames / self.fps:.1f}s to record)")
             return
@@ -369,8 +547,6 @@ class LoopPedal:
         else:
             loop = build_loop(frames, self._crossfade, self._codec, smart_seam=self.smart_seam)
         self._slots[self.active_slot] = loop
-        # Start playback just before the seam: the newest frames dissolve into the
-        # oldest ones, so the switch from live to loop is a fade, not a jump.
         k = min(self._crossfade, len(frames) // 2)
         start = len(loop) - k - 1 if k > 0 else 0
         self._player = Player(loop, self._codec, start=start)
@@ -392,6 +568,7 @@ class LoopPedal:
         frame = live_frame if live_frame is not None else self._last_live_frame
         if frame is None:
             return
+        self.auto_cut_armed = False
         self._frozen_frame = frame.copy()
         self._player = Player([self._codec.encode(self._frozen_frame)], self._codec)
         self.state = FREEZE
@@ -403,6 +580,117 @@ class LoopPedal:
     def toggle_ping_pong(self) -> None:
         self.ping_pong = not self.ping_pong
         self._log(f"LOOP  ping-pong mode {'ON' if self.ping_pong else 'OFF'}")
+
+    def toggle_auto_cut(self) -> bool:
+        self.auto_cut = not self.auto_cut
+        if not self.auto_cut:
+            self.auto_cut_armed = False
+        self._log(f"AUTOCUT mode {'ON' if self.auto_cut else 'OFF'}")
+        return self.auto_cut
+
+    def toggle_auto_stealth(self) -> bool:
+        self.auto_stealth = not self.auto_stealth
+        self.stealth_absence_frames = 0
+        self._log(f"STEALTH mode {'ON' if self.auto_stealth else 'OFF'}")
+        return self.auto_stealth
+
+    def set_stealth_threshold(self, threshold: float) -> float:
+        self.stealth_threshold = round(max(0.30, min(0.90, threshold)), 2)
+        self.stealth_return_threshold = min(0.95, max(0.60, self.stealth_threshold + 0.07))
+        self._log(f"STEALTH threshold set to {int(self.stealth_threshold * 100)}% (return at {int(self.stealth_return_threshold * 100)}%)")
+        return self.stealth_threshold
+
+    def cycle_stealth_threshold(self) -> float:
+        presets = [0.55, 0.60, 0.65, 0.70, 0.75]
+        cur = round(self.stealth_threshold, 2)
+        idx = 0
+        min_diff = 999.0
+        for i, p in enumerate(presets):
+            if abs(cur - p) < min_diff:
+                min_diff = abs(cur - p)
+                idx = i
+        nxt = presets[(idx + 1) % len(presets)]
+        return self.set_stealth_threshold(nxt)
+
+    def request_go_live(self) -> bool:
+        """Triggers go_live with smart auto-cut pose alignment if armed."""
+        if self.state not in (LOOPING, FREEZE):
+            self.go_live()
+            return False
+        if not self.auto_cut:
+            self.go_live()
+            return False
+        if self.auto_cut_armed:
+            # Second tap/click = manual force override cut
+            self.auto_cut_armed = False
+            self.go_live()
+            self._log("AUTOCUT manual override -> immediate live dissolve")
+            return False
+
+        self.auto_cut_armed = True
+        self.auto_cut_arm_time = time.time()
+        self._log("AUTOCUT armed: match posture to go live (or tap live key to force cut)")
+        return True
+
+    def check_auto_cut(self, align_score: float) -> str | None:
+        """Checks if armed auto-cut posture threshold is satisfied or timed out."""
+        if not self.auto_cut_armed:
+            return None
+        if align_score >= self.auto_cut_threshold:
+            self.auto_cut_armed = False
+            self.go_live()
+            self._log(f"AUTOCUT matched ({align_score*100:.0f}%) -> cut to live")
+            return "matched"
+        if time.time() - self.auto_cut_arm_time >= self.auto_cut_timeout:
+            self.auto_cut_armed = False
+            self.go_live()
+            self._log("AUTOCUT timeout fallback -> cut to live")
+            return "timeout"
+        return None
+
+    def check_stealth_presence(self, live_frame: np.ndarray, align_score: float | None = None) -> str | None:
+        """Detects desk absence to auto-loop, or desk return to resume live."""
+        if not self.auto_stealth:
+            self.last_presence_score = None
+            return None
+
+        ref_loop = self._slots.get(self.active_slot) or self._slots.get(1)
+        if not ref_loop:
+            self.last_presence_score = None
+            return "no_loop"
+
+        ref_frame = self._codec.decode(ref_loop[0])
+        score = compute_presence_score(live_frame, ref_frame)
+        self.last_presence_score = score
+
+        if self.state == LIVE:
+            if score < self.stealth_threshold:  # User stepped away from chair
+                self.stealth_absence_frames += 1
+                if self.stealth_absence_frames >= self.stealth_absence_threshold:
+                    self.stealth_absence_frames = 0
+                    self.stealth_return_frames = 0
+                    self.stealth_engaged_by_sensor = True
+                    chosen_slot = self.active_slot if self._slots.get(self.active_slot) else 1
+                    self.select_slot(chosen_slot)
+                    self._log(f"STEALTH absence detected ({score*100:.0f}%) -> auto-playing loop S{chosen_slot}")
+                    return "stealth_on"
+            else:
+                self.stealth_absence_frames = max(0, self.stealth_absence_frames - 1)
+
+        elif self.state == LOOPING and self.stealth_engaged_by_sensor:
+            if score >= self.stealth_return_threshold or (align_score is not None and align_score >= self.auto_cut_threshold):
+                self.stealth_return_frames += 1
+                if self.stealth_return_frames >= self.stealth_return_required:
+                    self.stealth_absence_frames = 0
+                    self.stealth_return_frames = 0
+                    self.stealth_engaged_by_sensor = False
+                    self.go_live()
+                    self._log(f"STEALTH user returned ({score*100:.0f}%) -> resumed live")
+                    return "stealth_off"
+            else:
+                self.stealth_return_frames = max(0, self.stealth_return_frames - 1)
+
+        return None
 
     def select_slot(self, slot_idx: int) -> None:
         if slot_idx not in self._slots:
@@ -443,17 +731,16 @@ class LoopPedal:
         return True
 
     def go_live(self) -> None:
+        self.auto_cut_armed = False
         if self.state == LIVE:
             return
         if self.state in (LOOPING, FREEZE) and self._fade_left > 0:
-            return  # already dissolving; let it finish
+            return
         self._recorder.take()
         if self.state in (LOOPING, FREEZE) and self._crossfade > 0 and self._player is not None:
-            # Keep playing while process() dissolves the loop into the live frames.
             self._fade_left = self._crossfade
             self._log(f"LIVE  dissolving into live over {self._crossfade / self.fps:.1f}s")
             return
-        # From REC the call already sees live, so a cut is invisible.
         self._player = None
         self._fade_left = 0
         self._frozen_frame = None
@@ -467,36 +754,62 @@ class LoopPedal:
         self._last_live_frame = live_frame
         if self.state == RECORDING:
             self._recorder.push(live_frame)
-            return live_frame
-        if self.state == FREEZE and self._frozen_frame is not None:
+            out = live_frame
+        elif self.state == FREEZE and self._frozen_frame is not None:
             if self._fade_left == 0:
-                return self._frozen_frame
-            a = (self._crossfade - self._fade_left + 1) / (self._crossfade + 1)
-            self._fade_left -= 1
-            frozen = self._frozen_frame
-            if self._fade_left == 0:
-                self._player = None
-                self._frozen_frame = None
-                self.state = LIVE
-            return cv2.addWeighted(frozen, 1.0 - a, live_frame, a, 0.0)
-        if self.state == LOOPING and self._player is not None:
+                out = self._frozen_frame
+            else:
+                a = (self._crossfade - self._fade_left + 1) / (self._crossfade + 1)
+                self._fade_left -= 1
+                frozen = self._frozen_frame
+                if self._fade_left == 0:
+                    self._player = None
+                    self._frozen_frame = None
+                    self.state = LIVE
+                out = cv2.addWeighted(frozen, 1.0 - a, live_frame, a, 0.0)
+        elif self.state == LOOPING and self._player is not None:
             loop_frame = self._player.next()
             if self._fade_left == 0:
-                return loop_frame
-            # Same ramp as the loop seam: live weight runs 1/(k+1) .. k/(k+1), then pure live.
-            a = (self._crossfade - self._fade_left + 1) / (self._crossfade + 1)
-            self._fade_left -= 1
-            if self._fade_left == 0:
-                self._player = None
-                self.state = LIVE
-            return cv2.addWeighted(loop_frame, 1.0 - a, live_frame, a, 0.0)
-        return live_frame
+                out = loop_frame
+            else:
+                a = (self._crossfade - self._fade_left + 1) / (self._crossfade + 1)
+                self._fade_left -= 1
+                if self._fade_left == 0:
+                    self._player = None
+                    self.state = LIVE
+                out = cv2.addWeighted(loop_frame, 1.0 - a, live_frame, a, 0.0)
+        else:
+            out = live_frame
+
+        if self.studio.lut_name != "normal" or self.studio.blur_mode != "off":
+            out = self.studio.apply(out)
+        return out
 
     def hud_info(self) -> dict:
         """What the preview overlay needs: state, seconds elapsed/total, 0..1 progress, slot info."""
+        slots_info = {
+            s: {
+                "filled": bool(len(self._slots.get(s, []))),
+                "duration": len(self._slots.get(s, [])) / self.fps if self._slots.get(s) else 0.0,
+            }
+            for s in sorted(self._slots.keys())
+        }
+        has_loop = bool(self._slots.get(self.active_slot) or self._slots.get(1))
         base = {
             "slot": self.active_slot,
             "ping_pong": self.ping_pong,
+            "slots": slots_info,
+            "auto_cut": self.auto_cut,
+            "auto_cut_armed": self.auto_cut_armed,
+            "auto_stealth": self.auto_stealth,
+            "stealth_engaged": self.stealth_engaged_by_sensor,
+            "stealth_score": self.last_presence_score,
+            "stealth_absence_frames": self.stealth_absence_frames,
+            "stealth_absence_max": self.stealth_absence_threshold,
+            "stealth_threshold": self.stealth_threshold,
+            "has_loop": has_loop,
+            "studio_lut": self.studio.lut_name,
+            "studio_blur": self.studio.blur_mode,
         }
         if self.state == RECORDING:
             elapsed = len(self._recorder) / self.fps
@@ -509,6 +822,8 @@ class LoopPedal:
         if self.state == FREEZE:
             return {**base, "state": FREEZE, "elapsed": 0.0, "total": 0.0, "progress": 1.0}
         return {**base, "state": LIVE, "elapsed": None, "total": None, "progress": None}
+
+
 
 
 
@@ -779,6 +1094,53 @@ STATE_STYLE = {   # colour (BGR), title
 }
 
 
+def draw_text_shadow(img: np.ndarray, text: str, org: tuple[int, int],
+                     font_face: int, font_scale: float,
+                     color: tuple[int, int, int], thickness: int = 1,
+                     shadow_color: tuple[int, int, int] = (10, 10, 10),
+                     offset: tuple[int, int] = (1, 1)) -> None:
+    """Renders anti-aliased text with drop shadow for crisp legibility over any video."""
+    x, y = org
+    dx, dy = offset
+    cv2.putText(img, text, (x + dx, y + dy), font_face, font_scale, shadow_color, thickness + 1, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), font_face, font_scale, color, thickness, cv2.LINE_AA)
+
+
+def draw_vector_icon(img: np.ndarray, icon_type: str, center: tuple[int, int],
+                     size: int, color: tuple[int, int, int]) -> None:
+    """Draws crisp geometric icons for modern button glyphs."""
+    cx, cy = center
+    r = max(2, size // 2)
+    if icon_type == "rec":
+        cv2.circle(img, (cx, cy), r, color, -1, cv2.LINE_AA)
+    elif icon_type == "stop":
+        cv2.rectangle(img, (cx - r + 1, cy - r + 1), (cx + r - 1, cy + r - 1), color, -1)
+    elif icon_type == "play":
+        pts = np.array([[cx - r // 2, cy - r], [cx - r // 2, cy + r], [cx + r, cy]], np.int32)
+        cv2.fillPoly(img, [pts], color, cv2.LINE_AA)
+    elif icon_type in ("pause", "freeze"):
+        bw = max(2, r // 2)
+        cv2.rectangle(img, (cx - r + 1, cy - r), (cx - r + 1 + bw, cy + r), color, -1)
+        cv2.rectangle(img, (cx + r - 1 - bw, cy - r), (cx + r - 1, cy + r), color, -1)
+    elif icon_type in ("loop", "boom"):
+        cv2.ellipse(img, (cx, cy), (r, r), 0, 45, 315, color, max(1, r // 4), cv2.LINE_AA)
+        cv2.circle(img, (cx + r - 1, cy), max(2, r // 3), color, -1, cv2.LINE_AA)
+    elif icon_type == "gear":
+        cv2.circle(img, (cx, cy), r, color, max(1, r // 3), cv2.LINE_AA)
+        cv2.circle(img, (cx, cy), max(1, r // 3), color, -1, cv2.LINE_AA)
+    elif icon_type == "help":
+        (tw, th), _ = cv2.getTextSize("?", FONT, 0.45, 1)
+        cv2.putText(img, "?", (cx - tw // 2, cy + th // 2), FONT, 0.45, color, 1, cv2.LINE_AA)
+    elif icon_type == "save":
+        cv2.rectangle(img, (cx - r + 1, cy - r + 1), (cx + r - 1, cy + r - 1), color, 1, cv2.LINE_AA)
+        cv2.line(img, (cx, cy - r + 2), (cx, cy + r - 2), color, 1, cv2.LINE_AA)
+    elif icon_type == "expand":
+        cv2.line(img, (cx - r, cy - r), (cx - r // 2, cy - r), color, 1, cv2.LINE_AA)
+        cv2.line(img, (cx - r, cy - r), (cx - r, cy - r // 2), color, 1, cv2.LINE_AA)
+        cv2.line(img, (cx + r, cy + r), (cx + r // 2, cy + r), color, 1, cv2.LINE_AA)
+        cv2.line(img, (cx + r, cy + r), (cx + r, cy + r // 2), color, 1, cv2.LINE_AA)
+
+
 def draw_rounded_rect(img: np.ndarray, pt1: tuple[int, int], pt2: tuple[int, int],
                       color: tuple[int, int, int], thickness: int = -1, radius: int = 8) -> None:
     """Draws a rounded rectangle with anti-aliasing."""
@@ -810,8 +1172,9 @@ def draw_rounded_rect(img: np.ndarray, pt1: tuple[int, int], pt2: tuple[int, int
 def draw_glass_pill(img: np.ndarray, pt1: tuple[int, int], pt2: tuple[int, int],
                     bg_color: tuple[int, int, int] = (16, 20, 26),
                     border_color: tuple[int, int, int] | None = (55, 65, 75),
-                    alpha: float = 0.78, radius: int = 8) -> None:
-    """Draws a translucent glassmorphic rounded pill background with subtle border."""
+                    alpha: float = 0.78, radius: int = 8,
+                    glow_color: tuple[int, int, int] | None = None) -> None:
+    """Draws a translucent glassmorphic rounded pill background with subtle specular border."""
     x0, y0 = pt1
     x1, y1 = pt2
     H, W = img.shape[:2]
@@ -828,9 +1191,14 @@ def draw_glass_pill(img: np.ndarray, pt1: tuple[int, int], pt2: tuple[int, int],
     if border_color is not None:
         draw_rounded_rect(img, (x0, y0), (x1, y1), border_color, 1, radius)
 
+    # Subtle top-edge specular highlight
+    if x1 - x0 > 2 * radius + 4 and y1 - y0 > 8:
+        hl_color = (min(255, bg_color[0] + 55), min(255, bg_color[1] + 55), min(255, bg_color[2] + 65))
+        cv2.line(img, (x0 + radius, y0 + 1), (x1 - radius, y0 + 1), hl_color, 1, cv2.LINE_AA)
+
 
 def draw_state_border(img: np.ndarray, state: str) -> None:
-    """Draws a prominent perimeter border indicating state with visual clarity."""
+    """Draws a prominent perimeter border indicating state with modern broadcast reticle accents."""
     h, w = img.shape[:2]
     thick = max(4, int(min(w, h) * 0.015))
 
@@ -847,11 +1215,29 @@ def draw_state_border(img: np.ndarray, state: str) -> None:
     else:
         color = (100, 100, 100)
 
+    # Perimeter border (ensures pixel [0, 0] is colored for test compatibility)
     cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, thick)
+
+    # High-tech studio viewfinder corner brackets
+    if w >= 120 and h >= 90:
+        b_len = max(14, min(w // 10, h // 10, 36))
+        b_thick = max(thick + 1, 5)
+        # Top-left
+        cv2.line(img, (0, 0), (b_len, 0), color, b_thick, cv2.LINE_AA)
+        cv2.line(img, (0, 0), (0, b_len), color, b_thick, cv2.LINE_AA)
+        # Top-right
+        cv2.line(img, (w - 1, 0), (w - 1 - b_len, 0), color, b_thick, cv2.LINE_AA)
+        cv2.line(img, (w - 1, 0), (w - 1, b_len), color, b_thick, cv2.LINE_AA)
+        # Bottom-left
+        cv2.line(img, (0, h - 1), (b_len, h - 1), color, b_thick, cv2.LINE_AA)
+        cv2.line(img, (0, h - 1), (0, h - 1 - b_len), color, b_thick, cv2.LINE_AA)
+        # Bottom-right
+        cv2.line(img, (w - 1, h - 1), (w - 1 - b_len, h - 1), color, b_thick, cv2.LINE_AA)
+        cv2.line(img, (w - 1, h - 1), (w - 1, h - 1 - b_len), color, b_thick, cv2.LINE_AA)
 
 
 class ToastNotifier:
-    """Displays temporary high-visibility on-screen announcements."""
+    """Displays temporary high-visibility on-screen announcements with modern capsule styling."""
 
     def __init__(self, duration: float = 1.8):
         self.duration = duration
@@ -872,70 +1258,348 @@ class ToastNotifier:
         progress = elapsed / self.duration
         alpha = max(0.0, min(1.0, 1.0 - progress ** 2))
         scale = max(0.6, min(1.0, w / 900))
-        (tw, th), _ = cv2.getTextSize(self.text, FONT, 0.70 * scale, 2)
+        (tw, th), _ = cv2.getTextSize(self.text, FONT, 0.65 * scale, 2)
 
         pad_x = int(24 * scale)
         pad_y = int(12 * scale)
-        bx0 = (w - tw) // 2 - pad_x
-        by0 = int(72 * scale)
-        bx1 = (w + tw) // 2 + pad_x
+        icon_space = int(20 * scale)
+        bx0 = (w - (tw + icon_space)) // 2 - pad_x
+        by0 = int(68 * scale)
+        bx1 = (w + (tw + icon_space)) // 2 + pad_x
         by1 = by0 + th + 2 * pad_y
 
         draw_glass_pill(img, (bx0, by0), (bx1, by1),
-                        bg_color=(18, 22, 28),
+                        bg_color=(15, 19, 26),
                         border_color=self.color,
-                        alpha=0.88 * alpha,
-                        radius=int(10 * scale))
+                        alpha=0.90 * alpha,
+                        radius=int(12 * scale))
+
+        # Beacon dot
+        dot_r = max(3, int(5 * scale))
+        dot_cx = bx0 + pad_x + dot_r
+        dot_cy = (by0 + by1) // 2
+        col_alpha = tuple(int(c * alpha) for c in self.color)
+        cv2.circle(img, (dot_cx, dot_cy), dot_r, col_alpha, -1, cv2.LINE_AA)
 
         text_col = tuple(int(c * alpha) for c in (255, 255, 255))
-        cv2.putText(img, self.text, ((w - tw) // 2, by0 + th + pad_y),
-                    FONT, 0.70 * scale, text_col, 2, cv2.LINE_AA)
+        tx = dot_cx + dot_r + int(10 * scale)
+        ty = (by0 + by1 + th) // 2
+        draw_text_shadow(img, self.text, (tx, ty), FONT, 0.65 * scale, text_col, 2)
 
 
 def draw_key_config_modal(img: np.ndarray, step: int, current_pedal: str, current_live: str) -> None:
-    """Interactive modal dialog for remapping keys directly in the preview UI."""
+    """Interactive modal dialog for remapping keys directly in the preview UI with 3D keycaps."""
     h, w = img.shape[:2]
     dim = np.zeros_like(img)
-    cv2.addWeighted(img, 0.25, dim, 0.75, 0, dst=img)
+    cv2.addWeighted(img, 0.22, dim, 0.78, 0, dst=img)
 
-    mw, mh = min(w - 24, 540), min(h - 24, 220)
+    mw, mh = min(w - 24, 560), min(h - 24, 230)
     mx0, my0 = (w - mw) // 2, (h - mh) // 2
     mx1, my1 = mx0 + mw, my0 + mh
 
     draw_glass_pill(img, (mx0, my0), (mx1, my1),
-                    bg_color=(20, 24, 32), border_color=(0, 210, 255),
-                    alpha=0.92, radius=12)
+                    bg_color=(18, 22, 30), border_color=(0, 210, 255),
+                    alpha=0.94, radius=14)
 
-    cv2.putText(img, "CONFIGURE HOTKEYS", (mx0 + 24, my0 + 36), FONT, 0.65, (0, 210, 255), 2, cv2.LINE_AA)
+    # Header with icon
+    cv2.putText(img, "CONFIGURE HARDWARE / PEDAL HOTKEYS", (mx0 + 24, my0 + 36),
+                FONT, 0.60, (0, 215, 255), 2, cv2.LINE_AA)
 
+    # Step progress pill
     if step == 1:
-        step_txt = "Step 1 of 2: Hold pedal hotkey"
-        prompt = "Press new PEDAL key (hold to record loop):"
-        curr = f"Current pedal key: {key_label(current_pedal)} ('{current_pedal}')"
+        step_txt = "Step 1 of 2: Hold pedal key (records loop while held)"
+        prompt = "Press new PEDAL key on keyboard now:"
+        curr_lbl = f"Current pedal key:  [{key_label(current_pedal)}]  ('{current_pedal}')"
+        curr_col = (50, 215, 75)
     else:
-        step_txt = "Step 2 of 2: Go-live tap hotkey"
-        prompt = "Press new GO-LIVE key (solo tap to end loop):"
-        curr = f"Current live key: {key_label(current_live)} ('{current_live}')"
+        step_txt = "Step 2 of 2: Go-live tap key (ends loop on solo tap)"
+        prompt = "Press new GO-LIVE key on keyboard now:"
+        curr_lbl = f"Current live key:   [{key_label(current_live)}]  ('{current_live}')"
+        curr_col = (0, 200, 255)
 
-    cv2.putText(img, step_txt, (mx0 + 24, my0 + 68), FONT, 0.48, (170, 180, 195), 1, cv2.LINE_AA)
-    cv2.putText(img, prompt, (mx0 + 24, my0 + 98), FONT, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, step_txt, (mx0 + 24, my0 + 68), FONT, 0.46, (170, 185, 200), 1, cv2.LINE_AA)
+    cv2.putText(img, prompt, (mx0 + 24, my0 + 100), FONT, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
 
-    (kw, kh), _ = cv2.getTextSize(curr, FONT, 0.48, 1)
-    badge_x0, badge_y0 = mx0 + 24, my0 + 115
-    badge_x1, badge_y1 = badge_x0 + kw + 16, badge_y0 + kh + 14
-    draw_glass_pill(img, (badge_x0, badge_y0), (badge_x1, badge_y1),
-                    bg_color=(28, 40, 32), border_color=(50, 205, 50),
-                    alpha=0.85, radius=6)
-    cv2.putText(img, curr, (badge_x0 + 8, badge_y0 + kh + 7), FONT, 0.48, (60, 230, 80), 1, cv2.LINE_AA)
+    # Keycap badge
+    (kw, kh), _ = cv2.getTextSize(curr_lbl, FONT, 0.46, 1)
+    bx0, by0 = mx0 + 24, my0 + 118
+    bx1, by1 = bx0 + kw + 20, by0 + kh + 16
+    draw_glass_pill(img, (bx0, by0), (bx1, by1),
+                    bg_color=(25, 36, 30), border_color=curr_col,
+                    alpha=0.88, radius=8)
+    cv2.putText(img, curr_lbl, (bx0 + 10, by0 + kh + 8), FONT, 0.46, curr_col, 1, cv2.LINE_AA)
 
-    cv2.putText(img, "Press key now, or Esc to cancel", (mx0 + 24, my1 - 20),
-                FONT, 0.44, (140, 150, 165), 1, cv2.LINE_AA)
+    cv2.putText(img, "Listening for any keystroke... (press Esc to cancel)",
+                (mx0 + 24, my1 - 20), FONT, 0.42, (140, 150, 165), 1, cv2.LINE_AA)
+
+
+def draw_help_modal(img: np.ndarray, current_pedal: str, current_live: str,
+                    mouse_pos: tuple[int, int] | None = None) -> None:
+    """Renders a sleek frosted glass cheatsheet modal detailing all controls."""
+    h, w = img.shape[:2]
+    dim = np.zeros_like(img)
+    cv2.addWeighted(img, 0.20, dim, 0.80, 0, dst=img)
+
+    mw, mh = min(w - 32, 700), min(h - 32, 450)
+    mx0, my0 = (w - mw) // 2, (h - mh) // 2
+    mx1, my1 = mx0 + mw, my0 + mh
+
+    draw_glass_pill(img, (mx0, my0), (mx1, my1),
+                    bg_color=(16, 20, 28), border_color=(0, 210, 255),
+                    alpha=0.95, radius=14)
+
+    # Title
+    cv2.putText(img, "LOOP PEDAL -- QUICK CONTROLS & SHORTCUTS",
+                (mx0 + 24, my0 + 36), FONT, 0.62, (0, 215, 255), 2, cv2.LINE_AA)
+
+    # Close button [X]
+    cx0, cy0 = mx1 - 42, my0 + 16
+    cx1, cy1 = mx1 - 16, my0 + 42
+    hover_x = mouse_pos and (cx0 <= mouse_pos[0] <= cx1 and cy0 <= mouse_pos[1] <= cy1)
+    x_border = (255, 255, 255) if hover_x else (70, 80, 95)
+    draw_glass_pill(img, (cx0, cy0), (cx1, cy1), bg_color=(28, 34, 46),
+                    border_color=x_border, alpha=0.9, radius=6)
+    cv2.putText(img, "X", (cx0 + 8, cy0 + 18), FONT, 0.45, (220, 230, 240), 1, cv2.LINE_AA)
+
+    # Section 1: Global Foot Pedal
+    y = my0 + 72
+    cv2.putText(img, "GLOBAL SYSTEM HOTKEYS (active while inside Zoom/Teams/Discord):",
+                (mx0 + 24, y), FONT, 0.46, (60, 230, 80), 1, cv2.LINE_AA)
+    y += 24
+    pedal_lbl = key_label(current_pedal)
+    live_lbl = key_label(current_live)
+    cv2.putText(img, f"  Pedal Key  [{pedal_lbl}]: HOLD to record live feed; RELEASE to loop automatically",
+                (mx0 + 24, y), FONT, 0.43, (240, 245, 250), 1, cv2.LINE_AA)
+    y += 20
+    cv2.putText(img, f"  Live Key   [{live_lbl}]: SOLO TAP to dissolve seamlessly back into live webcam",
+                (mx0 + 24, y), FONT, 0.43, (240, 245, 250), 1, cv2.LINE_AA)
+
+    # Section 2: In-App Keys & Dock Buttons
+    y += 34
+    cv2.putText(img, "PREVIEW WINDOW SHORTCUTS & CLICKABLE DOCK BUTTONS:",
+                (mx0 + 24, y), FONT, 0.46, (255, 200, 40), 1, cv2.LINE_AA)
+    y += 24
+
+    col1 = [
+        ("R", "Toggle Record / Loop (pedal simulator)"),
+        ("L", "Go Live (smart dissolve / auto-cut)"),
+        ("F", "Freeze frame snapshot / Unfreeze"),
+        ("P", "Toggle Boomerang forward-reverse"),
+        ("1 - 5", "Select loop slot (switch replays)"),
+        ("A", "Toggle AI Pose Auto-Cut (alignment cut)"),
+        ("[ / ]", "Adjust Stealth Threshold (-5% / +5%)"),
+    ]
+    col2 = [
+        ("T", "Toggle Presence Auto-Stealth (desk sensor)"),
+        ("C", "Cycle Studio Color LUT (Warm/Cool/Noir...)"),
+        ("B", "Cycle Studio Blur (Light/Studio/Strong)"),
+        ("S", "Save active loop to disk (saved_loops/)"),
+        ("O / Tab", "Cycle alignment view (ghost/edge/diff)"),
+        ("M / K", "Toggle Mini PiP / Remap keys in UI"),
+    ]
+
+    for (k_txt, desc) in col1:
+        cv2.putText(img, f"  [{k_txt}]", (mx0 + 24, y), FONT, 0.40, (0, 210, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, desc, (mx0 + 95, y), FONT, 0.38, (200, 210, 220), 1, cv2.LINE_AA)
+        y += 19
+
+    y_col2 = my0 + 72 + 24 + 20 + 34 + 24
+    for (k_txt, desc) in col2:
+        cv2.putText(img, f"  [{k_txt}]", (mx0 + 350, y_col2), FONT, 0.40, (0, 210, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, desc, (mx0 + 440, y_col2), FONT, 0.38, (200, 210, 220), 1, cv2.LINE_AA)
+        y_col2 += 19
+
+    # Section 3: Alignment radar guidance
+    y = max(y, y_col2) + 14
+    cv2.putText(img, "ALIGNMENT RADAR HUD & POSTURE MATCHING:", (mx0 + 24, y), FONT, 0.44, (180, 140, 255), 1, cv2.LINE_AA)
+    y += 20
+    align_hint = "Ghost: 50% opacity | Edge: neon contour outline | Diff: heat map | Split: 50/50"
+    cv2.putText(img, f"  {align_hint}", (mx0 + 24, y), FONT, 0.37, (190, 195, 205), 1, cv2.LINE_AA)
+    y += 17
+    match_hint = "Auto-Cut holds until posture >= 80% matches loop, then crossfades invisibly!"
+    cv2.putText(img, f"  {match_hint}", (mx0 + 24, y), FONT, 0.37, (50, 220, 120), 1, cv2.LINE_AA)
+
+    # Footer
+    cv2.putText(img, "Tip: All bottom dock buttons and slots are directly CLICKABLE with mouse!",
+                (mx0 + 24, my1 - 28), FONT, 0.42, (50, 220, 120), 1, cv2.LINE_AA)
+    cv2.putText(img, "Press Esc, ?, or click anywhere outside to close",
+                (mx0 + 24, my1 - 10), FONT, 0.38, (130, 140, 155), 1, cv2.LINE_AA)
+
+
+def draw_control_dock(img: np.ndarray, info: dict, key: str, live_key: str,
+                      align_mode: str = "ghost",
+                      mouse_pos: tuple[int, int] | None = None,
+                      clickable_buttons: list | None = None) -> None:
+    """Renders the sleek floating interactive control dock at the bottom of the preview."""
+    h, w = img.shape[:2]
+    if w < 420 or h < 220:
+        return
+
+    scale = max(0.52, min(1.0, w / 1250))
+    state = info["state"]
+    active_slot = info.get("slot", 1)
+    slots = info.get("slots", {})
+    ping_pong = info.get("ping_pong", False)
+    auto_cut_armed = info.get("auto_cut_armed", False)
+
+    dock_h = int(42 * scale)
+    dock_y1 = h - int(12 * scale)
+    dock_y0 = dock_y1 - dock_h
+
+    # Primary action button
+    if state == RECORDING:
+        prim_id, prim_txt, prim_col = "toggle_record", "LOOP", (200, 130, 30)
+    elif state in (LOOPING, FREEZE):
+        prim_id = "go_live"
+        prim_txt = "MATCH..." if auto_cut_armed else "LIVE"
+        prim_col = (0, 215, 255) if auto_cut_armed else (70, 170, 60)
+    else:
+        prim_id, prim_txt, prim_col = "toggle_record", "REC", (40, 40, 220)
+
+    freeze_txt = "LIVE" if state == FREEZE else "FREEZE"
+    freeze_col = (220, 140, 30) if state == FREEZE else (160, 170, 180)
+
+    btn_specs = [
+        {"id": prim_id, "text": prim_txt, "color": prim_col, "w": int(76 * scale), "glow": state == RECORDING or auto_cut_armed},
+        {"id": "toggle_freeze", "text": freeze_txt, "color": freeze_col, "w": int(68 * scale)},
+    ]
+
+    # Slot chips S1..S5
+    for s in range(1, 6):
+        is_active = (s == active_slot)
+        s_data = slots.get(s, {})
+        has_loop = s_data.get("filled", False)
+        s_col = (245, 175, 30) if is_active else ((60, 210, 80) if has_loop else (110, 120, 130))
+        btn_specs.append({
+            "id": f"slot_{s}",
+            "text": f"S{s}",
+            "color": s_col,
+            "w": int(30 * scale),
+            "active": is_active,
+            "has_dot": has_loop and not is_active,
+        })
+
+    # Boomerang toggle
+    boom_col = (30, 180, 245) if ping_pong else (130, 140, 150)
+    btn_specs.append({"id": "toggle_ping_pong", "text": "BOOM", "color": boom_col, "w": int(62 * scale), "active": ping_pong})
+
+    # Feature #1: Auto-cut toggle
+    auto_cut = info.get("auto_cut", False)
+    cut_txt = "MATCH..." if auto_cut_armed else "AUTOCUT"
+    cut_col = (0, 215, 255) if auto_cut_armed else ((60, 220, 80) if auto_cut else (120, 130, 140))
+    btn_specs.append({"id": "toggle_auto_cut", "text": cut_txt, "color": cut_col, "w": int(68 * scale), "active": auto_cut or auto_cut_armed, "glow": auto_cut_armed})
+
+    # Feature #3: Auto-stealth toggle & threshold chip
+    auto_stealth = info.get("auto_stealth", False)
+    has_loop = info.get("has_loop", False)
+    stealth_engaged = info.get("stealth_engaged", False)
+    stl_th = info.get("stealth_threshold", 0.65)
+    stl_th_pct = int(stl_th * 100)
+    if auto_stealth:
+        if not has_loop:
+            stealth_txt = "STL:NO LOOP"
+            stealth_col = (245, 160, 40)
+        elif stealth_engaged:
+            stealth_txt = "STL:LOOP"
+            stealth_col = (210, 140, 255)
+        else:
+            stealth_txt = "STEALTH"
+            stealth_col = (60, 220, 80)
+    else:
+        stealth_txt = "STEALTH"
+        stealth_col = (120, 130, 140)
+    btn_specs.append({
+        "id": "toggle_auto_stealth",
+        "text": stealth_txt,
+        "color": stealth_col,
+        "w": int(78 * scale) if not has_loop and auto_stealth else int(68 * scale),
+        "active": auto_stealth,
+        "glow": stealth_engaged,
+    })
+    btn_specs.append({
+        "id": "cycle_stealth_th",
+        "text": f"TH:{stl_th_pct}%",
+        "color": (210, 140, 255) if auto_stealth else (140, 150, 165),
+        "w": int(52 * scale),
+        "active": auto_stealth,
+    })
+
+    # Feature #6: Studio LUT and Blur
+    lut_name = info.get("studio_lut", "normal")
+    lut_col = (255, 185, 45) if lut_name != "normal" else (140, 150, 165)
+    btn_specs.append({"id": "cycle_lut", "text": f"LUT:{lut_name[:4].upper()}", "color": lut_col, "w": int(68 * scale), "active": lut_name != "normal"})
+
+    blur_mode = info.get("studio_blur", "off")
+    blur_col = (80, 210, 245) if blur_mode != "off" else (140, 150, 165)
+    btn_specs.append({"id": "cycle_blur", "text": f"BLUR:{blur_mode[:4].upper()}", "color": blur_col, "w": int(70 * scale), "active": blur_mode != "off"})
+
+    # Align mode cycle
+    align_short = align_mode[:4].upper()
+    btn_specs.append({"id": "cycle_align", "text": f"ALIGN:{align_short}", "color": (0, 200, 240), "w": int(82 * scale)})
+
+    # Utilities: Save, Keys, Help, Mini
+    btn_specs.append({"id": "save_loop", "text": "SAVE", "color": (150, 200, 230), "w": int(52 * scale)})
+    btn_specs.append({"id": "config_keys", "text": "KEYS", "color": (170, 180, 195), "w": int(52 * scale)})
+    btn_specs.append({"id": "toggle_help", "text": "? HELP", "color": (170, 180, 195), "w": int(54 * scale)})
+    btn_specs.append({"id": "toggle_mini", "text": "MINI", "color": (170, 180, 195), "w": int(50 * scale)})
+
+    pad = max(3, int(4 * scale))
+    total_w = sum(b["w"] for b in btn_specs) + (len(btn_specs) - 1) * pad
+    dock_pad_x = int(8 * scale)
+
+    # Center the dock
+    dx0 = (w - (total_w + 2 * dock_pad_x)) // 2
+    dx1 = dx0 + total_w + 2 * dock_pad_x
+
+    draw_glass_pill(img, (dx0, dock_y0), (dx1, dock_y1),
+                    bg_color=(14, 18, 25), border_color=(50, 60, 75),
+                    alpha=0.88, radius=int(12 * scale))
+
+    cur_x = dx0 + dock_pad_x
+    by0 = dock_y0 + int(4 * scale)
+    by1 = dock_y1 - int(4 * scale)
+
+    for b in btn_specs:
+        bw = b["w"]
+        bx0 = cur_x
+        bx1 = bx0 + bw
+        cur_x += bw + pad
+
+        is_hovered = False
+        if mouse_pos is not None:
+            mx, my = mouse_pos
+            if bx0 <= mx <= bx1 and by0 <= my <= by1:
+                is_hovered = True
+
+        if clickable_buttons is not None:
+            clickable_buttons.append({"id": b["id"], "rect": (bx0, by0, bx1, by1), "hover": is_hovered})
+
+        btn_bg = (32, 40, 52) if is_hovered else ((26, 32, 42) if b.get("active") else (20, 24, 32))
+        btn_border = (255, 255, 255) if is_hovered else (b["color"] if b.get("active") or b.get("glow") else (55, 65, 80))
+        btn_alpha = 0.95 if is_hovered else 0.85
+
+        draw_glass_pill(img, (bx0, by0), (bx1, by1),
+                        bg_color=btn_bg, border_color=btn_border,
+                        alpha=btn_alpha, radius=int(6 * scale))
+
+        if b.get("has_dot"):
+            cv2.circle(img, (bx1 - int(5 * scale), by0 + int(5 * scale)), int(2.5 * scale), (60, 220, 80), -1, cv2.LINE_AA)
+
+        fs = 0.38 * scale
+        txt = b["text"]
+        (tw, th), _ = cv2.getTextSize(txt, FONT, fs, 1)
+        tx = bx0 + (bw - tw) // 2
+        ty = (by0 + by1 + th) // 2
+        txt_color = (255, 255, 255) if is_hovered else (b["color"] if b.get("active") else (220, 225, 235))
+        draw_text_shadow(img, txt, (tx, ty), FONT, fs, txt_color, 1)
 
 
 def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
              align_mode: str = "ghost", align_score: float | None = None,
-             mini: bool = False) -> None:
-    """Status bar across the top of the preview: badge, timer, progress bar, hints."""
+             mini: bool = False,
+             clickable_buttons: list | None = None,
+             mouse_pos: tuple[int, int] | None = None) -> None:
+    """Status bar across the top of the preview and interactive control dock at the bottom."""
     h, w = img.shape[:2]
     state = info["state"]
     colour, title = STATE_STYLE.get(state, ((100, 100, 100), state))
@@ -982,11 +1646,16 @@ def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
 
         hint_txt = "m:expand"
         (hw, hh), _ = cv2.getTextSize(hint_txt, FONT, 0.35, 1)
-        draw_glass_pill(img, (w - hw - 18, pill_y0), (w - 8, pill_y1),
+        ex_x0 = w - hw - 18
+        ex_x1 = w - 8
+        draw_glass_pill(img, (ex_x0, pill_y0), (ex_x1, pill_y1),
                         bg_color=(16, 20, 26), border_color=(50, 60, 70),
                         alpha=0.70, radius=12)
         cv2.putText(img, hint_txt, (w - hw - 13, (pill_y0 + pill_y1 + hh) // 2),
                     FONT, 0.35, (175, 185, 195), 1, cv2.LINE_AA)
+
+        if clickable_buttons is not None:
+            clickable_buttons.append({"id": "toggle_mini", "rect": (ex_x0, pill_y0, ex_x1, pill_y1)})
         return
 
     scale = max(0.65, min(1.0, w / 1280))
@@ -998,10 +1667,10 @@ def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
     island_x1 = w - margin_x
     island_y1 = island_y0 + island_h
 
-    # Floating glass island
+    # Floating glass island at top
     draw_glass_pill(img, (island_x0, island_y0), (island_x1, island_y1),
                     bg_color=(15, 19, 26), border_color=(60, 72, 88),
-                    alpha=0.82, radius=int(10 * scale))
+                    alpha=0.85, radius=int(10 * scale))
 
     badge_margin = int(6 * scale)
     badge_y0 = island_y0 + badge_margin
@@ -1021,7 +1690,7 @@ def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
         badge_txt = title
 
     (tw, th), _ = cv2.getTextSize(badge_txt, FONT, fs_badge, 2)
-    has_dot = state == RECORDING
+    has_dot = state in (RECORDING, LIVE)
     dot_space = int(16 * scale) if has_dot else 0
     badge_w = tw + int(20 * scale) + dot_space
 
@@ -1030,57 +1699,120 @@ def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
 
     tx = badge_x0 + int(10 * scale)
     if has_dot:
-        dot_on = (time.time() % 1.0) < 0.6
+        if state == RECORDING:
+            dot_on = (time.time() % 1.0) < 0.6
+            dot_col = WHITE if dot_on else colour
+            halo_r = int((4 + 2 * math.sin(time.time() * 6.0)) * scale)
+            cv2.circle(img, (tx + int(4 * scale), (badge_y0 + badge_y1) // 2),
+                       max(1, halo_r), (80, 80, 255), 1, cv2.LINE_AA)
+        else:
+            dot_col = WHITE
         cv2.circle(img, (tx + int(4 * scale), (badge_y0 + badge_y1) // 2),
-                   int(4 * scale), WHITE if dot_on else colour, -1, cv2.LINE_AA)
+                   int(4 * scale), dot_col, -1, cv2.LINE_AA)
         tx += dot_space
 
-    cv2.putText(img, badge_txt, (tx, (badge_y0 + badge_y1 + th) // 2),
-                FONT, fs_badge, WHITE, 2, cv2.LINE_AA)
+    draw_text_shadow(img, badge_txt, (tx, (badge_y0 + badge_y1 + th) // 2),
+                     FONT, fs_badge, WHITE, 2)
 
     x = badge_x0 + badge_w + int(14 * scale)
     fs = 0.58 * scale
     timer = ""
     if state == RECORDING:
-        timer = f"{info['elapsed']:.1f}s"
+        timer = f"{info['elapsed']:.1f}s / {info['total']:.0f}s"
     elif state == LOOPING:
-        pp_badge = " [BOOMERANG]" if info.get("ping_pong") else ""
+        pp_badge = " [BOOM]" if info.get("ping_pong") else ""
         timer = f"{info['elapsed']:4.1f}s / {info['total']:.1f}s{pp_badge}"
     elif state == FREEZE:
         timer = "STILL SNAPSHOT"
+    elif state == LIVE:
+        timer = "LIVE CAMERA FEED"
 
     if timer:
         (tmw, tmh), _ = cv2.getTextSize(timer, FONT, fs, 1)
-        cv2.putText(img, timer, (x, (badge_y0 + badge_y1 + tmh) // 2),
-                    FONT, fs, (240, 245, 250), 1, cv2.LINE_AA)
+        draw_text_shadow(img, timer, (x, (badge_y0 + badge_y1 + tmh) // 2),
+                         FONT, fs, (240, 245, 250), 1)
         x += tmw + int(14 * scale)
 
+    # Precision Alignment Match Reticle
     if state in (LOOPING, FREEZE) and align_score is not None:
         pct = int(align_score * 100)
-        col = (60, 220, 60) if pct >= 80 else ((50, 205, 245) if pct >= 60 else (120, 130, 235))
-        align_txt = f"{pct}% ALIGN [{align_mode.upper()}]"
-        fs_a = 0.48 * scale
-        (aw, ah), _ = cv2.getTextSize(align_txt, FONT, fs_a, 1)
-        draw_glass_pill(img, (x, badge_y0), (x + aw + int(14 * scale), badge_y1),
-                        bg_color=(25, 30, 40), border_color=col, alpha=0.9,
-                        radius=int(5 * scale))
-        cv2.putText(img, align_txt, (x + int(7 * scale), (badge_y0 + badge_y1 + ah) // 2),
-                    FONT, fs_a, col, 1, cv2.LINE_AA)
-        x += aw + int(20 * scale)
+        if pct >= 80:
+            col = (60, 220, 60)
+            status_desc = "MATCH READY"
+        elif pct >= 60:
+            col = (50, 205, 245)
+            status_desc = "APPROACHING"
+        else:
+            col = (100, 110, 240)
+            status_desc = "ALIGNING"
 
+        align_txt = f"{pct}% {status_desc} [{align_mode.upper()}]"
+        fs_a = 0.46 * scale
+        (aw, ah), _ = cv2.getTextSize(align_txt, FONT, fs_a, 1)
+        al_w = aw + int(16 * scale)
+        draw_glass_pill(img, (x, badge_y0), (x + al_w, badge_y1),
+                        bg_color=(22, 28, 38), border_color=col, alpha=0.92,
+                        radius=int(6 * scale))
+        draw_text_shadow(img, align_txt, (x + int(8 * scale), (badge_y0 + badge_y1 + ah) // 2),
+                         FONT, fs_a, col, 1)
+        if clickable_buttons is not None:
+            clickable_buttons.append({"id": "cycle_align", "rect": (x, badge_y0, x + al_w, badge_y1)})
+        x += al_w + int(14 * scale)
+
+    # Auto-cut armed indicator
+    if info.get("auto_cut_armed"):
+        arm_txt = "[🎯 WAITING FOR POSTURE MATCH]"
+        pulse_col = (0, 215, 255) if (time.time() % 0.8) < 0.4 else (255, 200, 40)
+        (atw, ath), _ = cv2.getTextSize(arm_txt, FONT, 0.46 * scale, 1)
+        draw_text_shadow(img, arm_txt, (x, (badge_y0 + badge_y1 + ath) // 2), FONT, 0.46 * scale, pulse_col, 1)
+        x += atw + int(14 * scale)
+
+    # Stealth status indicator in top bar
+    if info.get("auto_stealth"):
+        stl_txt = ""
+        stl_col = (180, 180, 180)
+        if not info.get("has_loop"):
+            stl_txt = "[STEALTH: RECORD A LOOP FIRST]"
+            stl_col = (245, 160, 40)
+        elif state == LIVE:
+            abs_frames = info.get("stealth_absence_frames", 0)
+            score = info.get("stealth_score")
+            score_str = f"{int(score * 100)}%" if score is not None else "--%"
+            stl_th = info.get("stealth_threshold", 0.65)
+            stl_th_str = f"{int(stl_th * 100)}%"
+            if abs_frames > 0:
+                abs_max = max(1, info.get("stealth_absence_max", 30))
+                sec_left = max(0.0, (abs_max - abs_frames) / 30.0)
+                stl_txt = f"[STEALTH: ABSENT ({score_str} < {stl_th_str}) -> LOOP IN {sec_left:.1f}s]"
+                stl_col = (0, 215, 255) if (time.time() % 0.5) < 0.25 else (255, 120, 40)
+            else:
+                stl_txt = f"[STEALTH: ARMED (OCCUPIED {score_str} / CUT < {stl_th_str})]"
+                stl_col = (60, 220, 80)
+        elif state == LOOPING and info.get("stealth_engaged"):
+            stl_txt = "[STEALTH: AUTO-LOOP (SIT TO RETURN)]"
+            stl_col = (210, 140, 255)
+
+        if stl_txt:
+            (stlw, stlh), _ = cv2.getTextSize(stl_txt, FONT, 0.46 * scale, 1)
+            draw_text_shadow(img, stl_txt, (x, (badge_y0 + badge_y1 + stlh) // 2), FONT, 0.46 * scale, stl_col, 1)
+            x += stlw + int(14 * scale)
+
+    # Keyboard shortcut hint pills on the right side
+    pedal_str = key_label(key)
+    live_str = key_label(live_key)
     hints = {
-        LIVE: f"hold {key}: rec   f: freeze   k: keys   m: mini",
-        RECORDING: f"release {key}: loop   {live_key}: cancel",
-        LOOPING: f"hold {key}: re-rec   {live_key}: live   o: align   k: keys   m: mini",
-        FREEZE: f"{live_key} or f: go live   o: align   m: mini",
+        LIVE: f"Hold [{pedal_str}]: Rec  |  A: Cut  |  T: Stealth  |  ?: Help",
+        RECORDING: f"Release [{pedal_str}]: Loop  |  [{live_str}]: Cancel",
+        LOOPING: f"[{live_str}]: Live  |  A: Auto-Cut  |  C: LUT  |  B: Blur",
+        FREEZE: f"[{live_str}] or [F]: Go Live  |  ?: Help",
     }.get(state, "")
-    fs_h = 0.45 * scale
+    fs_h = 0.44 * scale
     (hw, hh), _ = cv2.getTextSize(hints, FONT, fs_h, 1)
     hx = max(x, island_x1 - int(12 * scale) - hw)
-    cv2.putText(img, hints, (hx, (badge_y0 + badge_y1 + hh) // 2),
-                FONT, fs_h, (185, 195, 205), 1, cv2.LINE_AA)
+    draw_text_shadow(img, hints, (hx, (badge_y0 + badge_y1 + hh) // 2),
+                     FONT, fs_h, (185, 195, 205), 1)
 
-    # Sleek embedded progress track & bar
+    # Sleek embedded progress track & luminous progress bar
     if info.get("progress") is not None:
         p_y = island_y1 - int(4 * scale)
         p_x0 = island_x0 + int(8 * scale)
@@ -1090,6 +1822,13 @@ def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str,
         cv2.line(img, (p_x0, p_y), (p_x1, p_y), (40, 48, 60), max(2, int(3 * scale)), cv2.LINE_AA)
         if prog_w > 0:
             cv2.line(img, (p_x0, p_y), (p_x0 + prog_w, p_y), colour, max(2, int(3 * scale)), cv2.LINE_AA)
+            cv2.circle(img, (p_x0 + prog_w, p_y), max(2, int(3 * scale)), (255, 255, 255), -1, cv2.LINE_AA)
+
+    # Render floating control dock at bottom
+    draw_control_dock(img, info, key, live_key, align_mode=align_mode,
+                      mouse_pos=mouse_pos, clickable_buttons=clickable_buttons)
+
+
 
 
 _ORIGINAL_WINDOW_STYLES: dict[str, int] = {}
@@ -1150,6 +1889,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     sys_default_live = "ctrl_r" if sys.platform == "win32" else "cmd_r"
     default_key = cfg.get("key", "alt_r")
     default_live_key = cfg.get("live_key", sys_default_live)
+    default_stealth_th = float(cfg.get("stealth_threshold", 0.65))
 
     ap.add_argument("--camera", type=int, default=None,
                     help="OpenCV camera index of your real webcam (default: first index that is a live sensor)")
@@ -1186,6 +1926,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="path to video file to preload into slot 1")
     ap.add_argument("--save-dir", type=str, default="./saved_loops",
                     help="directory to save loop recordings (default: ./saved_loops)")
+    ap.add_argument("--auto-cut", action=argparse.BooleanOptionalAction, default=True,
+                    help="AI pose alignment auto-cut: wait for posture match before going live (default: enabled)")
+    ap.add_argument("--auto-stealth", action="store_true",
+                    help="auto-stealth presence sensor: auto-switch to loop when leaving desk")
+    ap.add_argument("--stealth-threshold", type=float, default=default_stealth_th,
+                    help=f"absence presence score threshold for auto-stealth (default: {default_stealth_th:g})")
+    ap.add_argument("--lut", choices=STUDIO_LUTS, default="normal",
+                    help="studio color grading LUT (default: normal)")
+    ap.add_argument("--blur", choices=STUDIO_BLURS, default="off",
+                    help="portrait bokeh depth blur (default: off)")
     return ap.parse_args(argv)
 
 
@@ -1200,7 +1950,11 @@ def main(argv=None) -> int:
 
     pedal = LoopPedal(JpegCodec(args.quality), args.fps, args.max_seconds, args.min_seconds,
                       args.crossfade, smart_seam=args.smart_seam, ping_pong=args.ping_pong,
+                      auto_cut=args.auto_cut, auto_stealth=args.auto_stealth,
+                      stealth_threshold=args.stealth_threshold,
                       log=lambda m: print(time.strftime("%H:%M:%S"), m))
+    pedal.studio.set_lut(args.lut)
+    pedal.studio.set_blur(args.blur)
 
     if args.load_loop:
         pedal.load_slot(args.load_loop, slot_idx=1)
@@ -1231,12 +1985,15 @@ def main(argv=None) -> int:
 
     if not args.no_preview:
         print("Preview keys:\n"
-              "  r = start/stop recording   l = go live / cancel\n"
+              "  r = start/stop recording   l = go live / auto-cut\n"
               "  f = freeze frame           p = toggle ping-pong\n"
+              "  a = toggle auto-cut        t = toggle auto-stealth\n"
+              "  c = cycle studio LUT       b = cycle portrait blur\n"
               "  1-5 = select slot          s = save active loop\n"
               "  o / Tab = cycle alignment mode (ghost/edge/diff/split)\n"
               "  m = toggle small window mode (always-on-top PiP)\n"
-              "  k = configure hotkeys in UI\n"
+              "  [ / ] = adjust stealth threshold (-5% / +5%)\n"
+              "  k = configure hotkeys in UI   ? / h = cheat sheet\n"
               "  q = quit")
     print("Ctrl+C to quit.")
 
@@ -1256,6 +2013,11 @@ def main(argv=None) -> int:
     cfg_live = current_live_key
     captured_keys: queue.Queue = queue.Queue()
 
+    mouse_pos = [0, 0]
+    clickable_buttons: list[dict] = []
+    clicked_action: list[str | None] = [None]
+    show_help = [False]
+
     def on_capture(name: str):
         captured_keys.put(name)
 
@@ -1274,8 +2036,20 @@ def main(argv=None) -> int:
             cv2.resizeWindow(window, width, height)
 
         def on_mouse(event, x, y, flags, param):
-            if mini_mode and event == cv2.EVENT_LBUTTONDOWN:
-                if sys.platform == "win32":
+            mouse_pos[0] = x
+            mouse_pos[1] = y
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if show_help[0]:
+                    show_help[0] = False
+                    return
+                # Check if a dock or mini button was clicked
+                for btn in clickable_buttons:
+                    bx0, by0, bx1, by1 = btn["rect"]
+                    if bx0 <= x <= bx1 and by0 <= y <= by1:
+                        clicked_action[0] = btn["id"]
+                        return
+                # In mini mode on Windows, clicking background drags the window
+                if mini_mode and sys.platform == "win32":
                     try:
                         import ctypes
                         user32 = ctypes.windll.user32
@@ -1323,7 +2097,8 @@ def main(argv=None) -> int:
                 elif ev == "up":
                     pedal.pedal_up()
                 elif ev == "live":
-                    pedal.go_live()
+                    if pedal.request_go_live():
+                        toast.show("AUTOCUT: MATCH POSTURE TO CUT", (0, 215, 255))
 
             out = pedal.process(frame)
 
@@ -1349,8 +2124,21 @@ def main(argv=None) -> int:
                 mode = align_modes[align_idx]
                 if pedal.state in (LOOPING, FREEZE):
                     align_score = compute_alignment_score(frame, out)
+                    if pedal.auto_cut_armed and align_score is not None:
+                        cut_res = pedal.check_auto_cut(align_score)
+                        if cut_res == "matched":
+                            toast.show(">>> AUTOCUT MATCHED -> LIVE <<<", (60, 220, 60))
+                        elif cut_res == "timeout":
+                            toast.show(">>> AUTOCUT TIMEOUT -> LIVE <<<", (240, 160, 40))
                     if args.overlay > 0:
                         shown = blend_overlay(frame, out, args.overlay, mode=mode)
+
+                stealth_res = pedal.check_stealth_presence(frame, align_score=align_score)
+                if stealth_res == "stealth_on":
+                    toast.show(">>> STEALTH: DESK ABSENCE DETECTED <<<", (210, 140, 255))
+                elif stealth_res == "stealth_off":
+                    toast.show(">>> STEALTH: RESUMED LIVE <<<", (60, 220, 60))
+
                 preview = cv2.flip(shown, 1)  # mirror the self-view only; the call gets it unmirrored
 
                 if show_border:
@@ -1358,14 +2146,100 @@ def main(argv=None) -> int:
 
                 toast.draw(preview)
 
+                clickable_buttons.clear()
                 draw_hud(preview, pedal.hud_info(), pedal_label, live_label,
-                         align_mode=mode, align_score=align_score, mini=mini_mode)
+                         align_mode=mode, align_score=align_score, mini=mini_mode,
+                         clickable_buttons=clickable_buttons, mouse_pos=tuple(mouse_pos))
 
                 if key_config_step > 0:
                     draw_key_config_modal(preview, key_config_step, cfg_pedal, cfg_live)
+                elif show_help[0]:
+                    draw_help_modal(preview, current_key, current_live_key, mouse_pos=tuple(mouse_pos))
 
                 cv2.imshow(window, preview)
                 key = cv2.waitKey(1) & 0xFF
+
+                # Process mouse action if clicked
+                action = clicked_action[0]
+                clicked_action[0] = None
+                if action is not None:
+                    if action == "toggle_record":
+                        pedal.toggle_record()
+                    elif action == "go_live":
+                        if pedal.request_go_live():
+                            toast.show("AUTOCUT: MATCH POSTURE TO CUT", (0, 215, 255))
+                    elif action == "toggle_freeze":
+                        pedal.freeze(frame)
+                    elif action.startswith("slot_"):
+                        s_idx = int(action.split("_")[1])
+                        pedal.select_slot(s_idx)
+                    elif action == "toggle_ping_pong":
+                        pedal.toggle_ping_pong()
+                        toast.show(f"BOOMERANG: {'ON' if pedal.ping_pong else 'OFF'}", (30, 180, 245))
+                    elif action == "toggle_auto_cut":
+                        ac = pedal.toggle_auto_cut()
+                        toast.show(f"AUTOCUT: {'ON' if ac else 'OFF'}", (0, 215, 255) if ac else (180, 180, 180))
+                    elif action == "toggle_auto_stealth":
+                        ast = pedal.toggle_auto_stealth()
+                        has_loop = bool(pedal._slots.get(pedal.active_slot) or pedal._slots.get(1))
+                        if ast:
+                            if has_loop:
+                                toast.show("STEALTH ON: WATCHING DESK", (210, 140, 255))
+                            else:
+                                toast.show("STEALTH ON: RECORD A LOOP FIRST!", (245, 160, 40))
+                        else:
+                            toast.show("STEALTH: OFF", (180, 180, 180))
+                    elif action == "cycle_stealth_th":
+                        new_th = pedal.cycle_stealth_threshold()
+                        save_config({"stealth_threshold": new_th})
+                        toast.show(f"STEALTH THRESHOLD: {int(new_th * 100)}% (SAVED)", (210, 140, 255))
+                    elif action == "cycle_lut":
+                        lut = pedal.studio.cycle_lut()
+                        toast.show(f"LUT: {lut.upper()}", (255, 185, 45))
+                    elif action == "cycle_blur":
+                        b_mode = pedal.studio.cycle_blur()
+                        toast.show(f"PORTRAIT BLUR: {b_mode.upper()}", (80, 210, 245))
+                    elif action == "cycle_align":
+                        align_idx = (align_idx + 1) % len(align_modes)
+                        toast.show(f"ALIGN: {align_modes[align_idx].upper()}", (0, 200, 255))
+                    elif action == "save_loop":
+                        os.makedirs(args.save_dir, exist_ok=True)
+                        fname = f"loop_slot_{pedal.active_slot}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+                        if pedal.save_slot(os.path.join(args.save_dir, fname)):
+                            toast.show(f"Saved Slot {pedal.active_slot} to MP4", (50, 220, 50))
+                        else:
+                            toast.show(f"Slot {pedal.active_slot} is empty!", (40, 40, 230))
+                    elif action == "config_keys":
+                        key_config_step = 1
+                        cfg_pedal = current_key
+                        cfg_live = current_live_key
+                        while not captured_keys.empty():
+                            captured_keys.get_nowait()
+                        if hotkey is not None:
+                            hotkey.set_capture_callback(on_capture)
+                    elif action == "toggle_help":
+                        show_help[0] = not show_help[0]
+                    elif action == "toggle_mini":
+                        mini_mode = not mini_mode
+                        if mini_mode:
+                            try:
+                                cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 1)
+                            except Exception:
+                                pass
+                            if args.frameless:
+                                set_window_borderless(window, True)
+                            cv2.resizeWindow(window, 360, 202)
+                            toast.show("MINI WINDOW (FRAMELESS PIP)", (0, 200, 255))
+                        else:
+                            if args.frameless:
+                                set_window_borderless(window, False)
+                            if not args.topmost:
+                                try:
+                                    cv2.setWindowProperty(window, cv2.WND_PROP_TOPMOST, 0)
+                                except Exception:
+                                    pass
+                            cv2.resizeWindow(window, width, height)
+                            toast.show("FULL PREVIEW", (0, 200, 255))
 
                 # Key configuration modal handling
                 if key_config_step > 0:
@@ -1413,10 +2287,43 @@ def main(argv=None) -> int:
 
                 if key == ord("q"):
                     break
-                if key == ord("r"):
+                if key in (ord("h"), ord("?")):
+                    show_help[0] = not show_help[0]
+                elif key == 27:  # Esc
+                    if show_help[0]:
+                        show_help[0] = False
+                elif key == ord("r"):
                     pedal.toggle_record()
                 elif key == ord("l"):
-                    pedal.go_live()
+                    if pedal.request_go_live():
+                        toast.show("AUTOCUT: MATCH POSTURE TO CUT", (0, 215, 255))
+                elif key == ord("a"):
+                    ac = pedal.toggle_auto_cut()
+                    toast.show(f"AUTOCUT: {'ON' if ac else 'OFF'}", (0, 215, 255) if ac else (180, 180, 180))
+                elif key == ord("t"):
+                    ast = pedal.toggle_auto_stealth()
+                    has_loop = bool(pedal._slots.get(pedal.active_slot) or pedal._slots.get(1))
+                    if ast:
+                        if has_loop:
+                            toast.show("STEALTH ON: WATCHING DESK", (210, 140, 255))
+                        else:
+                            toast.show("STEALTH ON: RECORD A LOOP FIRST!", (245, 160, 40))
+                    else:
+                        toast.show("STEALTH: OFF", (180, 180, 180))
+                elif key in (ord("["), ord("-")):
+                    new_th = pedal.set_stealth_threshold(pedal.stealth_threshold - 0.05)
+                    save_config({"stealth_threshold": new_th})
+                    toast.show(f"STEALTH THRESHOLD: {int(new_th * 100)}% (SAVED)", (210, 140, 255))
+                elif key in (ord("]"), ord("="), ord("+")):
+                    new_th = pedal.set_stealth_threshold(pedal.stealth_threshold + 0.05)
+                    save_config({"stealth_threshold": new_th})
+                    toast.show(f"STEALTH THRESHOLD: {int(new_th * 100)}% (SAVED)", (210, 140, 255))
+                elif key == ord("c"):
+                    lut = pedal.studio.cycle_lut()
+                    toast.show(f"LUT: {lut.upper()}", (255, 185, 45))
+                elif key == ord("b"):
+                    b_mode = pedal.studio.cycle_blur()
+                    toast.show(f"PORTRAIT BLUR: {b_mode.upper()}", (80, 210, 245))
                 elif key == ord("f"):
                     pedal.freeze(frame)
                 elif key == ord("p"):
@@ -1460,6 +2367,7 @@ def main(argv=None) -> int:
                         hotkey.set_capture_callback(on_capture)
                 if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                     break
+
     except KeyboardInterrupt:
         pass
     finally:

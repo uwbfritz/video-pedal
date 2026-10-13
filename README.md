@@ -180,47 +180,82 @@ Two things to watch for:
 Both keys work from any app. Right Command / right Ctrl only counts when pressed on its own; as
 part of a shortcut it is ignored.
 
-### Preview Window Controls
+### Preview Window & Mouse Dock Controls
 
-| key | does |
+The interface features a studio-grade floating glassmorphic dock. All buttons can be clicked with your mouse, or triggered via keyboard shortcuts:
+
+| Button / Key | Does |
 |---|---|
-| `r` | start / stop recording |
-| `l` | go live / cancel recording |
-| `f` | freeze frame (instant still snapshot with smooth dissolve) |
-| `p` | toggle ping-pong (forward-reverse boomerang) loop mode |
-| `s` | save active loop to disk as an MP4 |
-| `o` or `Tab` | cycle alignment overlay mode: Ghost &rarr; Edge silhouette &rarr; Diff heat-map &rarr; Split screen |
-| `1`–`5` | switch between 5 independent loop preset slots |
-| `m` | toggle small floating window mode (frameless PiP pinned on top of other apps; click & drag anywhere to move) |
-| `k` | configure global pedal & live keys interactively in the UI |
-| `q` | quit |
+| `[● REC]` / `r` | Start / stop recording (pedal simulator) |
+| `[▲ LIVE]` / `l` | Go live with seamless crossfade dissolve / trigger smart auto-cut |
+| `[❚❚ FREEZE]` / `f` | Freeze frame (instant still snapshot with smooth dissolve) |
+| `[⇄ BOOM]` / `p` | Toggle ping-pong (forward-reverse boomerang) loop mode |
+| `[AUTOCUT]` / `a` | Toggle AI pose auto-alignment cut (waits for posture match before going live) |
+| `[STEALTH]` / `t` | Toggle auto-stealth presence sensor (loops when leaving desk; returns when seated) |
+| `[TH:65%]` / `[` or `]` | Adjust absence presence threshold down/up by 5% (also `-` / `+`, saves to config) |
+| `[LUT]` / `c` | Cycle color grading LUT (`normal` &rarr; `warm` &rarr; `cool` &rarr; `vibrant` &rarr; `noir` &rarr; `soft`) |
+| `[BLUR]` / `b` | Cycle portrait bokeh background blur (`off` &rarr; `light` &rarr; `studio` &rarr; `strong`) |
+| `[S1]..[S5]` / `1`–`5` | Switch between 5 loop preset slots (displays filled status dot & duration) |
+| `[💾 SAVE]` / `s` | Save active loop to disk as an MP4 in `saved_loops/` |
+| `[◉ ALIGN]` / `o` or `Tab` | Cycle alignment overlay mode: Ghost &rarr; Edge silhouette &rarr; Diff heat-map &rarr; Split screen |
+| `[⚙ KEYS]` / `k` | Configure global pedal & live keys interactively with 3D keycap UI |
+| `[? HELP]` / `h` or `?` | Toggle quick interactive shortcuts cheat sheet modal overlay |
+| `[⤢ MINI]` / `m` | Toggle compact floating PiP mode (frameless; click & drag anywhere to move) |
+| `q` or `Esc` | Quit app (or close active modal dialog) |
 
 Ctrl+C in the terminal also quits.
 
-### Visual State Feedback
+### Advanced Studio Features
 
-- **Perimeter Colored Halo / Border**:
-  - **LIVE**: Solid rich emerald green border.
+1. **AI Pose Auto-Alignment & Auto-Cut (#1)**:
+   - When enabled, pressing the live key (`l` or `[▲ LIVE]`) arms the cut reticle (`[🎯 WAITING FOR POSTURE MATCH]`).
+   - The app waits until your current posture matches the recorded loop (&ge; 80% match) before initiating the crossfade dissolve, eliminating telltale jump cuts.
+   - Double-tapping `l` or clicking `[▲ LIVE]` forces an immediate override dissolve.
+   - Built-in 6.0-second timeout fallback ensures you never get locked out.
+
+2. **Desk Presence Sensor / Auto-Stealth (#3)**:
+   - Real-time computer vision senses when you step away from your chair (posture correlation drops under empty-desk threshold).
+   - Automatically switches your camera output to your saved loop so you never appear absent.
+   - When you sit back down and align with your loop, it seamlessly dissolves you back to live.
+
+3. **Studio Post-Processing: Background Blur & Color LUTs (#6)**:
+   - **Portrait Bokeh Vignette Blur**: Softens distracting background clutter around your head/torso while keeping you crisp (`light`, `studio`, `strong`).
+   - **Color Grading LUTs**: Professional real-time color palettes including `warm` (flattering skin tone warmth), `cool` (crisp modern cinematic), `vibrant` (rich saturation), `noir` (dramatic high-contrast black & white), and `soft` (filmic bloom).
+   - Applied to both live feed and virtual camera output.
+
+### Visual State Feedback & Alignment Radar
+
+- **Studio Viewfinder Framing**:
+  - **LIVE**: Solid rich emerald green border with broadcast viewfinder corner reticles.
   - **LOOPING**: Warm amber-orange border with gentle breathing pulse.
-  - **RECORDING**: High-alert flashing red border.
-  - **FREEZE**: Ice-blue border.
-- **On-Screen State Transition Banners**: Instant high-visibility toast banner (e.g. `>>> YOU ARE LIVE <<<` or `>>> LOOPING STARTED <<<`) whenever state changes, so your live status is unmistakable even in peripheral vision.
+  - **RECORDING**: High-alert flashing red border with pulsing halo beacon.
+  - **FREEZE**: Frost cyan border with still frame indicator.
+- **Precision Alignment Radar**:
+  - Shows real-time alignment match percentage and readiness tier (`MATCH READY` in green &ge; 80%, `APPROACHING` in yellow 60–79%, `ALIGNING` in red < 60%).
+- **Interactive Floating Dock**:
+  - Hover highlights, tactile active states, and slot status indicators.
+- **On-Screen State Transition Capsules**: Instant high-visibility frosted glass toast notification whenever state changes.
+
 
 ## Handy variants
 
 ```
-python loop_pedal.py --no-vcam        # no virtual camera needed: preview only
-python loop_pedal.py --mini           # start in compact floating window mode
-python loop_pedal.py --topmost        # keep window always pinned on top of Zoom/other apps
-python loop_pedal.py --list-cameras   # which index is the real webcam?
-python loop_pedal.py --camera 1       # use that index
-python loop_pedal.py --ping-pong      # smooth boomerang looping
+python loop_pedal.py --no-vcam            # no virtual camera needed: preview only
+python loop_pedal.py --mini               # start in compact floating window mode
+python loop_pedal.py --auto-stealth       # enable auto-stealth presence sensor
+python loop_pedal.py --lut warm           # warm skin-tone studio color grading
+python loop_pedal.py --blur studio        # portrait bokeh background blur
+python loop_pedal.py --topmost            # keep window always pinned on top of Zoom/other apps
+python loop_pedal.py --list-cameras       # which index is the real webcam?
+python loop_pedal.py --camera 1           # use that index
+python loop_pedal.py --ping-pong          # smooth boomerang looping
 python loop_pedal.py --load-loop clip.mp4 # preload pre-recorded loop
-python loop_pedal.py --no-smart-seam  # disable automatic pose-matching seam search
-python loop_pedal.py --key f13        # different pedal key
-python loop_pedal.py --live-key f14   # different go-live key
-python loop_pedal.py --overlay 0      # no ghost: preview shows exactly what goes out
-python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going live
+python loop_pedal.py --no-smart-seam      # disable automatic pose-matching seam search
+python loop_pedal.py --no-auto-cut        # disable auto-alignment cut gate
+python loop_pedal.py --key f13            # different pedal key
+python loop_pedal.py --live-key f14       # different go-live key
+python loop_pedal.py --overlay 0          # no ghost: preview shows exactly what goes out
+python loop_pedal.py --crossfade 0        # hard cuts at the seam and when going live
 ```
 
 ## All options
@@ -229,6 +264,11 @@ python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going liv
 |---|---|---|
 | `--key` | `alt_r` | pedal key. Modifier names like `alt_r`, `ctrl_r`, `shift_r`, function keys like `f13`, or a single letter. |
 | `--live-key` | `ctrl_r` (Win) / `cmd_r` (macOS) | go-live key, pressed once on its own to end the loop or cancel a recording. |
+| `--auto-cut` | `True` | wait for posture match (&ge; 80%) before cutting to live (`--no-auto-cut` to disable) |
+| `--auto-stealth` | `False` | auto-stealth presence sensor: auto-switch to loop when leaving desk, resume when returning |
+| `--stealth-threshold` | `0.65` | presence sensitivity score threshold below which absence is detected |
+| `--lut` | `normal` | studio color grading profile (`normal`, `warm`, `cool`, `vibrant`, `noir`, `soft`) |
+| `--blur` | `off` | portrait bokeh depth blur (`off`, `light`, `studio`, `strong`) |
 | `--camera` | auto | OpenCV index of the real webcam; default is the first index that is a live sensor |
 | `--size` | `1280x720` | requested capture size |
 | `--fps` | `30` | output frame rate |
