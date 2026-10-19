@@ -28,6 +28,7 @@ import contextlib
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import subprocess
 import sys
@@ -38,7 +39,22 @@ import numpy as np
 
 LIVE, RECORDING, LOOPING, FREEZE = "LIVE", "REC", "LOOP", "FREEZE"
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else ".", "config.json")
+
+def get_config_path() -> str:
+    if not getattr(sys, "frozen", False):
+        return str(Path(__file__).absolute().parent / "config.json")
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        if not base.is_absolute():
+            base = Path.home() / "AppData" / "Roaming"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        if not base.is_absolute():
+            base = Path.home() / ".config"
+    return str(base / "video-pedal" / "config.json")
+
+
+CONFIG_PATH = get_config_path()
 
 
 def load_config() -> dict:
@@ -55,6 +71,7 @@ def save_config(data: dict) -> None:
     try:
         current = load_config()
         current.update(data)
+        Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2)
     except Exception as exc:
