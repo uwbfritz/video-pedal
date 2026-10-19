@@ -64,7 +64,135 @@ Per frame: camera → `LoopPedal.process()` → virtual camera + preview window.
   (including the dissolve to live), the overlay blend and the two-key hotkey mapping.
   They swap in a raw codec for JPEG and never touch a camera.
 
-## Setup
+## Standalone executables (Linux and Windows)
+
+Each build produces **one executable per OS**, with Python and the Python/native
+dependencies included. End users do not need Python. Builds retain the console
+for logs and Ctrl+C. Virtual-camera **drivers are not included or installed**:
+install OBS Studio on Windows or install/load v4l2loopback on Linux as described
+under [Virtual camera device](#2-virtual-camera-device-once).
+
+### Download and run
+
+Open this repository's [Actions page](https://github.com/uwbfritz/video-pedal/actions/workflows/build.yml),
+select a successful **Build executables** run for the revision you trust, and
+download the appropriate artifact from its **Artifacts** section (GitHub sign-in
+may be required):
+
+| Artifact download | Contents after unzipping the Actions download |
+|---|---|
+| `video-pedal-linux-x86_64` | `video-pedal-linux-x86_64.tar.gz`; extract it to get `video-pedal` |
+| `video-pedal-windows-x86_64` | `video-pedal.exe` |
+
+Linux, after unzipping the artifact:
+
+```bash
+tar -xzf video-pedal-linux-x86_64.tar.gz   # preserves executable permission
+./video-pedal --help
+./video-pedal --no-vcam                  # preview without a virtual-camera driver
+./video-pedal                            # preview + virtual camera
+```
+
+Windows PowerShell, after **Extract All** on the artifact ZIP:
+
+```powershell
+.\video-pedal.exe --help
+.\video-pedal.exe --no-vcam
+.\video-pedal.exe
+```
+
+`--no-vcam` still needs a real webcam and GUI session. Add `--no-pedal` to use
+preview-window controls instead of global hotkeys.
+
+These are **x86_64** builds, not ARM or universal binaries. Linux CI builds on
+**Ubuntu 22.04 (glibc 2.35)**; target a compatible glibc-based desktop with glibc
+2.35 or newer, not all Linux distributions (in particular, not musl/Alpine).
+Newer glibc alone does not guarantee all system libraries are present. The GUI
+needs OpenGL/EGL, GLib, X11/XCB and related libraries; on Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libegl1 libglib2.0-0 libx11-6 libxext6 \
+  libxrender1 libsm6 libice6 libxcb1 libxcb-xinerama0 libxcb-cursor0 \
+  libxkbcommon-x11-0 libdbus-1-3
+```
+
+Global hotkeys use **X11/Xorg**. Wayland restricts observing keys in other windows;
+use an Xorg session, or `--no-pedal` (the GUI may still need XWayland).
+Windows CI uses **Windows Server 2022**; this is not a guarantee of compatibility
+with every Windows version. Camera permissions and driver requirements from the
+setup section still apply. One-file builds unpack libraries into a temporary
+directory at startup; that directory must permit execution.
+
+### Settings and saved loops
+
+Packaged settings (hotkeys and thresholds) persist across launches and executable
+updates in:
+
+- Linux: `$XDG_CONFIG_HOME/video-pedal/config.json` when `XDG_CONFIG_HOME` is an
+  absolute path, otherwise `~/.config/video-pedal/config.json`.
+- Windows: `%APPDATA%\video-pedal\config.json`, falling back to
+  `~\AppData\Roaming\video-pedal\config.json` if `APPDATA` is unset or not absolute.
+
+The directory is created on first save, not in the temporary extraction directory
+or beside the executable. Source execution continues using `config.json` beside
+`loop_pedal.py`. Existing settings are not automatically moved; to reuse them,
+copy that file to the packaged settings location.
+
+Saved videos are **unchanged**: `./saved_loops` relative to the working directory,
+not the settings or extraction directory. Launch from a writable directory or set
+`--save-dir` explicitly, e.g. `./video-pedal --save-dir "$HOME/Videos/saved_loops"`
+or `.\video-pedal.exe --save-dir "$env:USERPROFILE\Videos\saved_loops"`.
+Existing video files are never migrated.
+
+### Build locally
+
+Use **64-bit CPython 3.12** and build natively on each target OS; PyInstaller is
+not a Linux-to-Windows cross-compiler. To match the Linux CI baseline, build on
+Ubuntu 22.04; building on a newer distribution can raise the required glibc version.
+Keep the GUI-enabled `opencv-python` dependency, not `opencv-python-headless`.
+
+Linux (install Python 3.12 first, plus the GUI libraries above):
+
+```bash
+sudo apt-get install -y build-essential xvfb xauth
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt -r requirements-build.txt
+xvfb-run -a python -m pytest -q
+python -m PyInstaller --clean --noconfirm video-pedal.spec
+./dist/video-pedal --help
+VIDEO_PEDAL_EXECUTABLE="$PWD/dist/video-pedal" xvfb-run -a python -m pytest tests/test_frozen.py -q
+```
+
+Windows PowerShell (install 64-bit Python 3.12 first):
+
+```powershell
+py -3.12 -m venv .venv
+# No activation or execution-policy change is needed.
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt -r requirements-build.txt
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm video-pedal.spec
+.\dist\video-pedal.exe --help
+$env:VIDEO_PEDAL_EXECUTABLE = "$PWD\dist\video-pedal.exe"
+.\.venv\Scripts\python.exe -m pytest tests/test_frozen.py -q
+```
+
+The common build command is `python -m PyInstaller --clean --noconfirm video-pedal.spec`.
+Outputs are `dist/video-pedal` or `dist/video-pedal.exe`. Build tools are isolated
+in `requirements-build.txt`; runtime requirements remain in `requirements.txt`.
+The standard OpenCV/NumPy hooks collect native libraries and GUI plugins. Our
+explicit pynput hook collects platform keyboard, mouse and utility backends
+without importing display-sensitive modules during the build.
+
+CI runs the source tests and frozen `--help`, then the packaging-only
+`--check-packaged-dependencies` diagnostic: native pyvirtualcam backend imports,
+pynput backend imports (no listeners), NumPy/OpenCV JPEG round-trip and a tiny GUI
+window (under Xvfb on Linux). Neither smoke check opens a camera or validates
+physical camera capture, installed virtual-camera drivers, or real global hotkey
+delivery. Those need manual testing on the target machine.
+
+## Setup (from source)
 
 macOS, Windows and Linux. The one-time part is getting a virtual camera device onto
 the system; after that it's `python loop_pedal.py`. I've only run this on a Mac; the
